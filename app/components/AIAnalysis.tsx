@@ -1,18 +1,26 @@
 "use client";
 
 import { useState } from "react";
-import { pipeline } from "@huggingface/transformers";
 
 type AnalysisResult = {
   crop: string;
+
   observations: string[];
+
   possible_conditions: {
     condition: string;
     confidence_level: "HIGH" | "MEDIUM" | "LOW";
     reason: string;
   }[];
-  severity: "LOW" | "MODERATE" | "HIGH" | "UNKNOWN";
+
+  severity:
+    | "LOW"
+    | "MODERATE"
+    | "HIGH"
+    | "UNKNOWN";
+
   management_guidance: string[];
+
   weather_assessment: {
     status:
       | "ACT_NOW"
@@ -22,16 +30,20 @@ type AnalysisResult = {
     reason: string;
     action_window: string;
   };
+
   follow_up: {
     recommended: boolean;
     interval_hours: number;
     reason: string;
   };
+
   uncertainties: string[];
+
   expert_review: {
     recommended: boolean;
     reason: string;
   };
+
   farmer_summary: string;
 };
 
@@ -41,95 +53,147 @@ type AIAnalysisProps = {
   location: string;
   latitude: number | null;
   longitude: number | null;
+
   onAnalysisComplete?: (
-    analysis: AnalysisResult
+    result: AnalysisResult
   ) => void;
 };
 
-type ClassResult = {
-  label: string;
-  score: number;
-};
+/* =========================================================
+   FAST IMAGE PREPARATION
+   ========================================================= */
 
-let classifierPromise: Promise<any> | null = null;
-
-async function getClassifier() {
-  if (!classifierPromise) {
-    classifierPromise = pipeline(
-      "zero-shot-image-classification",
-      "Xenova/clip-vit-base-patch32"
-    );
+async function prepareImage(
+  file: File
+): Promise<File> {
+  /*
+   * Small images don't need processing.
+   */
+  if (
+    file.size <= 1_500_000 &&
+    file.type.startsWith("image/")
+  ) {
+    return file;
   }
 
-  return classifierPromise;
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+
+    const objectUrl =
+      URL.createObjectURL(file);
+
+    image.onload = () => {
+      try {
+        const MAX_SIZE = 1280;
+
+        let width = image.naturalWidth;
+        let height = image.naturalHeight;
+
+        /*
+         * Resize only if necessary.
+         */
+        if (
+          width > MAX_SIZE ||
+          height > MAX_SIZE
+        ) {
+          if (width > height) {
+            height =
+              Math.round(
+                (height / width) *
+                  MAX_SIZE
+              );
+
+            width = MAX_SIZE;
+          } else {
+            width =
+              Math.round(
+                (width / height) *
+                  MAX_SIZE
+              );
+
+            height = MAX_SIZE;
+          }
+        }
+
+        const canvas =
+          document.createElement("canvas");
+
+        canvas.width = width;
+        canvas.height = height;
+
+        const context =
+          canvas.getContext("2d");
+
+        if (!context) {
+          URL.revokeObjectURL(
+            objectUrl
+          );
+
+          resolve(file);
+          return;
+        }
+
+        context.drawImage(
+          image,
+          0,
+          0,
+          width,
+          height
+        );
+
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(
+              objectUrl
+            );
+
+            if (!blob) {
+              resolve(file);
+              return;
+            }
+
+            const optimizedFile =
+              new File(
+                [blob],
+                "crop-analysis.jpg",
+                {
+                  type: "image/jpeg",
+                  lastModified:
+                    Date.now(),
+                }
+              );
+
+            resolve(
+              optimizedFile
+            );
+          },
+          "image/jpeg",
+          0.82
+        );
+      } catch {
+        URL.revokeObjectURL(
+          objectUrl
+        );
+
+        resolve(file);
+      }
+    };
+
+    image.onerror = () => {
+      URL.revokeObjectURL(
+        objectUrl
+      );
+
+      resolve(file);
+    };
+
+    image.src = objectUrl;
+  });
 }
 
-function confidenceFromScore(
-  score: number
-): "HIGH" | "MEDIUM" | "LOW" {
-  if (score >= 0.6) return "HIGH";
-  if (score >= 0.35) return "MEDIUM";
-  return "LOW";
-}
-
-function conditionName(label: string) {
-  const names: Record<string, string> = {
-    healthy: "Healthy-looking crop tissue",
-    fungal: "Possible fungal disease symptoms",
-    bacterial: "Possible bacterial disease symptoms",
-    viral: "Possible viral disease symptoms",
-    pest: "Possible pest or insect damage",
-    nutrient: "Possible nutrient deficiency or imbalance",
-    drought: "Possible drought or heat stress",
-    water: "Possible excess-moisture or water stress",
-    physical: "Possible physical or environmental damage",
-  };
-
-  return names[label] || label;
-}
-
-function buildCandidates(crop: string) {
-  const c = crop.trim() || "crop";
-
-  return [
-    {
-      key: "healthy",
-      text: `a healthy ${c} leaf with normal green tissue`,
-    },
-    {
-      key: "fungal",
-      text: `a ${c} leaf showing fungal disease symptoms`,
-    },
-    {
-      key: "bacterial",
-      text: `a ${c} leaf showing bacterial disease symptoms`,
-    },
-    {
-      key: "viral",
-      text: `a ${c} leaf showing viral disease symptoms`,
-    },
-    {
-      key: "pest",
-      text: `a ${c} leaf showing insect or pest damage`,
-    },
-    {
-      key: "nutrient",
-      text: `a ${c} leaf showing nutrient deficiency symptoms`,
-    },
-    {
-      key: "drought",
-      text: `a ${c} leaf showing drought or heat stress`,
-    },
-    {
-      key: "water",
-      text: `a ${c} leaf showing excess moisture or water stress`,
-    },
-    {
-      key: "physical",
-      text: `a ${c} leaf showing physical or environmental damage`,
-    },
-  ];
-}
+/* =========================================================
+   MAIN COMPONENT
+   ========================================================= */
 
 export default function AIAnalysis({
   image,
@@ -140,19 +204,39 @@ export default function AIAnalysis({
   onAnalysisComplete,
 }: AIAnalysisProps) {
   const [analysis, setAnalysis] =
-    useState<AnalysisResult | null>(null);
+    useState<AnalysisResult | null>(
+      null
+    );
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [loading, setLoading] =
+    useState(false);
+
+  const [error, setError] =
+    useState("");
+
+  const [progress, setProgress] =
+    useState("");
+
+  const [progressStep, setProgressStep] =
+    useState(0);
+
+  /* =======================================================
+     ANALYZE
+     ======================================================= */
 
   async function analyzeCrop() {
+    if (loading) return;
     if (!image) {
-      setError("Please upload a crop image first.");
+      setError(
+        "Please upload a crop image first."
+      );
       return;
     }
 
     if (!crop.trim()) {
-      setError("Please enter the crop name first.");
+      setError(
+        "Please enter the crop name first."
+      );
       return;
     }
 
@@ -166,14 +250,33 @@ export default function AIAnalysis({
       return;
     }
 
+    const totalStart =
+      performance.now();
+
     try {
       setLoading(true);
       setError("");
       setAnalysis(null);
 
       /*
-       * WEATHER
+       * -----------------------------------------------------
+       * STEP 1
+       * Start image compression and weather request
+       * AT THE SAME TIME.
+       *
+       * This saves time because both operations happen
+       * concurrently.
+       * -----------------------------------------------------
        */
+
+      setProgress(
+        "Preparing your crop image..."
+      );
+
+      setProgressStep(1);
+
+      const imagePromise =
+        prepareImage(image);
 
       const weatherUrl =
         `https://api.open-meteo.com/v1/forecast` +
@@ -184,8 +287,32 @@ export default function AIAnalysis({
         `&forecast_days=2` +
         `&timezone=auto`;
 
-      const weatherResponse =
-        await fetch(weatherUrl);
+      const weatherPromise =
+        fetch(weatherUrl);
+
+      /*
+       * Wait for both.
+       */
+      const [
+        optimizedImage,
+        weatherResponse,
+      ] = await Promise.all([
+        imagePromise,
+        weatherPromise,
+      ]);
+
+      /*
+       * -----------------------------------------------------
+       * STEP 2
+       * Weather
+       * -----------------------------------------------------
+       */
+
+      setProgress(
+        "Connecting field weather..."
+      );
+
+      setProgressStep(2);
 
       if (!weatherResponse.ok) {
         throw new Error(
@@ -196,455 +323,188 @@ export default function AIAnalysis({
       const weatherData =
         await weatherResponse.json();
 
-      const rainProbability =
+      const next12HourRainProbability =
         weatherData.hourly
           ?.precipitation_probability
           ?.slice(0, 12) ?? [];
 
-      const rainForecast =
-        weatherData.hourly?.rain?.slice(
-          0,
-          12
-        ) ?? [];
+      const next12HourRain =
+        weatherData.hourly
+          ?.rain
+          ?.slice(0, 12) ?? [];
 
       const maxRainProbability =
-        rainProbability.length
-          ? Math.max(...rainProbability)
+        next12HourRainProbability.length >
+        0
+          ? Math.max(
+              ...next12HourRainProbability
+            )
           : 0;
 
       const totalForecastRain =
-        rainForecast.reduce(
-          (sum: number, value: number) =>
+        next12HourRain.reduce(
+          (
+            sum: number,
+            value: number
+          ) =>
             sum + (value || 0),
           0
         );
 
-      const temperature =
-        Number(
-          weatherData.current?.temperature_2m
-        ) || 0;
+      const weatherSummary = `
+Current temperature: ${
+        weatherData.current
+          ?.temperature_2m ??
+        "unknown"
+      } °C
 
-      const humidity =
-        Number(
-          weatherData.current
-            ?.relative_humidity_2m
-        ) || 0;
+Current humidity: ${
+        weatherData.current
+          ?.relative_humidity_2m ??
+        "unknown"
+      } %
+
+Rain currently: ${
+        weatherData.current
+          ?.rain ?? "unknown"
+      } mm
+
+Wind speed: ${
+        weatherData.current
+          ?.wind_speed_10m ??
+        "unknown"
+      } km/h
+
+Maximum precipitation probability over next 12 hours: ${maxRainProbability} %
+
+Estimated rain over next 12 hours: ${totalForecastRain.toFixed(
+        1
+      )} mm
+`;
 
       /*
-       * LOCAL VISION MODEL
+       * -----------------------------------------------------
+       * STEP 3
+       * Send to existing backend.
+       *
+       * IMPORTANT:
+       * /api/analyze is NOT changed.
+       * -----------------------------------------------------
        */
 
-      const classifier =
-        await getClassifier();
+      setProgress(
+        "Field Intelligence is analyzing..."
+      );
 
-      const candidates =
-        buildCandidates(crop);
+      setProgressStep(3);
 
-      const imageUrl =
-        URL.createObjectURL(image);
+      const formData =
+        new FormData();
 
-      let visualResults: ClassResult[];
+      formData.append(
+        "image",
+        optimizedImage
+      );
 
-      try {
-        visualResults =
-          await classifier(
-            imageUrl,
-            candidates.map(
-              (item) => item.text
-            ),
-            {
-              top_k: 5,
-            }
-          );
-      } finally {
-        URL.revokeObjectURL(imageUrl);
-      }
+      formData.append(
+        "crop",
+        crop.trim()
+      );
 
-      if (
-        !visualResults ||
-        !visualResults.length
-      ) {
+      formData.append(
+        "location",
+        location.trim()
+      );
+
+      formData.append(
+        "weather",
+        weatherSummary
+      );
+
+      const apiStart =
+        performance.now();
+
+      const response =
+        await fetch(
+          "/api/analyze",
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+      const apiTime =
+        performance.now() -
+        apiStart;
+
+      console.log(
+        `Field Intelligence API: ${apiTime.toFixed(
+          0
+        )}ms`
+      );
+
+      /*
+       * -----------------------------------------------------
+       * STEP 4
+       * Parse result
+       * -----------------------------------------------------
+       */
+
+      setProgress(
+        "Finishing field assessment..."
+      );
+
+      setProgressStep(4);
+
+      const result =
+        await response.json();
+
+      if (!response.ok) {
         throw new Error(
-          "The field vision model returned no visual result."
+          result.error ||
+            "AI analysis failed."
         );
       }
 
-      const topResult =
-        visualResults[0];
-
-      const topCandidate =
-        candidates.find(
-          (candidate) =>
-            candidate.text ===
-            topResult.label
+      if (!result.analysis) {
+        throw new Error(
+          "The AI returned no analysis."
         );
+      }
 
-      const topKey =
-        topCandidate?.key || "unknown";
+      const finalAnalysis =
+        result.analysis as AnalysisResult;
 
-      const confidence =
-        topResult.score;
+      setAnalysis(
+        finalAnalysis
+      );
 
       /*
-       * WEATHER-AWARE RISK
+       * -----------------------------------------------------
+       * SAVE TO HISTORY / ALERTS
+       * -----------------------------------------------------
        */
 
-      const diseaseLike = [
-        "fungal",
-        "bacterial",
-        "viral",
-      ].includes(topKey);
+      onAnalysisComplete?.(
+        finalAnalysis
+      );
 
-      const pestLike =
-        topKey === "pest";
+      const totalTime =
+        performance.now() -
+        totalStart;
 
-      const stressLike = [
-        "drought",
-        "water",
-        "nutrient",
-        "physical",
-      ].includes(topKey);
+      console.log(
+        `Total Field Intelligence time: ${totalTime.toFixed(
+          0
+        )}ms`
+      );
 
-      let severity:
-        | "LOW"
-        | "MODERATE"
-        | "HIGH"
-        | "UNKNOWN" = "LOW";
-
-      if (
-        confidence >= 0.6 &&
-        (diseaseLike || pestLike)
-      ) {
-        severity = "HIGH";
-      } else if (
-        confidence >= 0.35 &&
-        (diseaseLike ||
-          pestLike ||
-          stressLike)
-      ) {
-        severity = "MODERATE";
-      }
-
-      const diseaseWeatherRisk =
-        diseaseLike &&
-        (humidity >= 75 ||
-          maxRainProbability >= 60 ||
-          totalForecastRain >= 2);
-
-      if (
-        diseaseWeatherRisk &&
-        severity === "MODERATE"
-      ) {
-        severity = "HIGH";
-      }
-
-      /*
-       * OBSERVATIONS
-       */
-
-      const observations: string[] = [
-        `The visual screening model most strongly matched: ${topResult.label}.`,
-        `Visual screening confidence: ${(confidence * 100).toFixed(0)}%.`,
-        `Field location captured at ${latitude.toFixed(
-          4
-        )}, ${longitude.toFixed(4)}.`,
-      ];
-
-      if (humidity >= 75) {
-        observations.push(
-          `Current relative humidity is ${humidity}%, which indicates a humid field environment.`
-        );
-      }
-
-      if (maxRainProbability >= 60) {
-        observations.push(
-          `Rain probability reaches ${maxRainProbability}% during the next 12 hours.`
-        );
-      }
-
-      if (temperature >= 35) {
-        observations.push(
-          `Current temperature is ${temperature}°C, so heat stress should be considered.`
-        );
-      }
-
-      /*
-       * POSSIBLE CONDITIONS
-       */
-
-      const possibleConditions =
-        visualResults
-          .slice(0, 3)
-          .map((result) => {
-            const candidate =
-              candidates.find(
-                (item) =>
-                  item.text ===
-                  result.label
-              );
-
-            const key =
-              candidate?.key || "unknown";
-
-            let reason =
-              `The visual model assigned ${(result.score * 100).toFixed(
-                0
-              )}% relative confidence to this visual category.`;
-
-            if (
-              key === "fungal" &&
-              diseaseWeatherRisk
-            ) {
-              reason +=
-                " Humidity/rain conditions also increase the need for field inspection.";
-            }
-
-            return {
-              condition:
-                conditionName(key),
-              confidence_level:
-                confidenceFromScore(
-                  result.score
-                ),
-              reason,
-            };
-          });
-
-      /*
-       * MANAGEMENT
-       */
-
-      const management: string[] = [];
-
-      if (topKey === "healthy") {
-        management.push(
-          "Continue routine field scouting and compare new images with this baseline."
-        );
-
-        management.push(
-          "Prioritize irrigation, nutrition, and pest monitoring according to the crop's normal schedule."
-        );
-      } else if (diseaseLike) {
-        management.push(
-          "Inspect several plants across the field to determine whether the visual symptoms are widespread or localized."
-        );
-
-        management.push(
-          "Remove or isolate clearly affected plant material where appropriate and avoid unnecessary movement of potentially contaminated material between field areas."
-        );
-
-        management.push(
-          "If disease symptoms are confirmed, follow locally approved agricultural guidance and product labels for the specific crop and condition."
-        );
-      } else if (pestLike) {
-        management.push(
-          "Inspect both sides of leaves and nearby plants for active pests and fresh feeding damage."
-        );
-
-        management.push(
-          "Check whether damage is isolated or spreading before choosing a control measure."
-        );
-
-        management.push(
-          "Use locally approved integrated pest-management guidance for the identified crop and pest."
-        );
-      } else if (topKey === "drought") {
-        management.push(
-          "Inspect soil moisture and plants across multiple field locations rather than judging the entire field from one image."
-        );
-
-        management.push(
-          "Prioritize appropriate irrigation according to crop stage, soil condition, and local agronomic guidance."
-        );
-      } else if (topKey === "water") {
-        management.push(
-          "Inspect drainage and soil moisture around affected plants."
-        );
-
-        management.push(
-          "Avoid unnecessary additional irrigation until field moisture conditions are confirmed."
-        );
-      } else if (topKey === "nutrient") {
-        management.push(
-          "Compare symptoms across older and younger leaves and inspect whether the pattern is uniform across the field."
-        );
-
-        management.push(
-          "Confirm suspected nutrient problems with appropriate soil or plant testing before applying corrective inputs."
-        );
-      } else {
-        management.push(
-          "Inspect several plants around the field to verify whether the observed pattern is representative."
-        );
-
-        management.push(
-          "Continue monitoring the affected area and compare the next image with this assessment."
-        );
-      }
-
-      /*
-       * WEATHER DECISION
-       */
-
-      let weatherStatus:
-        | "ACT_NOW"
-        | "WAIT"
-        | "MONITOR"
-        | "EXPERT_REVIEW" =
-        "MONITOR";
-
-      let actionWindow =
-        "Monitor the field and reassess during the next scouting cycle.";
-
-      let weatherReason =
-        `Current conditions are ${temperature}°C with ${humidity}% relative humidity.`;
-
-      if (
-        diseaseLike &&
-        maxRainProbability >= 60
-      ) {
-        weatherStatus = "ACT_NOW";
-
-        actionWindow =
-          "Prioritize field inspection before or around the upcoming wet period.";
-
-        weatherReason =
-          `Disease-like visual symptoms combined with a ${maxRainProbability}% rain probability create a higher-priority scouting window.`;
-      } else if (
-        diseaseLike &&
-        humidity >= 75
-      ) {
-        weatherStatus = "MONITOR";
-
-        actionWindow =
-          "Inspect within the next 24 hours.";
-
-        weatherReason =
-          `The field is currently humid (${humidity}%), which makes close monitoring of disease-like symptoms more important.`;
-      } else if (
-        topKey === "drought" &&
-        temperature >= 35
-      ) {
-        weatherStatus = "ACT_NOW";
-
-        actionWindow =
-          "Inspect crop water status during the current heat period.";
-
-        weatherReason =
-          `Temperature is ${temperature}°C and the image shows possible heat/drought stress.`;
-      } else if (
-        maxRainProbability >= 70
-      ) {
-        weatherStatus = "WAIT";
-
-        actionWindow =
-          "Complete non-urgent field work before the wet period where practical.";
-
-        weatherReason =
-          `Rain probability reaches ${maxRainProbability}% during the next 12 hours.`;
-      }
-
-      /*
-       * FOLLOW-UP
-       */
-
-      let followUpHours = 48;
-
-      if (
-        severity === "HIGH" ||
-        diseaseWeatherRisk
-      ) {
-        followUpHours = 24;
-      } else if (
-        severity === "MODERATE"
-      ) {
-        followUpHours = 36;
-      }
-
-      /*
-       * UNCERTAINTIES
-       */
-
-      const uncertainties: string[] = [
-        "This is visual screening rather than a laboratory-confirmed diagnosis.",
-        "A single crop image may not represent conditions across the entire field.",
-      ];
-
-      if (confidence < 0.5) {
-        uncertainties.push(
-          "The visual signal is not strong enough to treat the predicted category as a confirmed diagnosis."
-        );
-      }
-
-      /*
-       * EXPERT REVIEW
-       */
-
-      const expertRecommended =
-        confidence < 0.35 ||
-        severity === "HIGH";
-
-      /*
-       * FARMER SUMMARY
-       */
-
-      let farmerSummary = "";
-
-      if (topKey === "healthy") {
-        farmerSummary =
-          `The ${crop} image currently looks closer to healthy crop tissue than the other visual categories tested. Keep this assessment as a field baseline and continue routine scouting.`;
-      } else {
-        farmerSummary =
-          `AgriCustos detected a ${conditionName(
-            topKey
-          ).toLowerCase()} pattern in the ${crop} image. ${actionWindow} Recheck the affected area in about ${followUpHours} hours and compare new images for progression.`;
-      }
-
-      if (diseaseWeatherRisk) {
-        farmerSummary +=
-          " Weather conditions make disease-related monitoring more important right now.";
-      }
-
-      const finalAnalysis: AnalysisResult = {
-        crop,
-        observations,
-        possible_conditions:
-          possibleConditions,
-        severity,
-        management_guidance:
-          management,
-        weather_assessment: {
-          status: weatherStatus,
-          reason: weatherReason,
-          action_window: actionWindow,
-        },
-        follow_up: {
-          recommended: true,
-          interval_hours:
-            followUpHours,
-          reason:
-            "Compare the next field image with this assessment and check whether symptoms are spreading, stabilizing, or improving.",
-        },
-        uncertainties,
-        expert_review: {
-          recommended:
-            expertRecommended,
-          reason:
-            expertRecommended
-              ? "The visual evidence is either uncertain or indicates a higher-priority field condition that should be verified by an agricultural professional."
-              : "Current visual evidence is sufficient for routine field monitoring, but confirmation is recommended if symptoms progress.",
-        },
-        farmer_summary:
-          farmerSummary,
-      };
-
-      setAnalysis(finalAnalysis);
-
-      // Send the completed result back to the dashboard.
-      onAnalysisComplete?.(finalAnalysis);
+      setProgress(
+        "Analysis complete."
+      );
     } catch (err) {
       console.error(
-        "AgriCustos local AI error:",
+        "AgriCustos analysis error:",
         err
       );
 
@@ -653,14 +513,21 @@ export default function AIAnalysis({
           ? err.message
           : "Unable to analyze the crop."
       );
+
+      setProgress("");
+      setProgressStep(0);
     } finally {
       setLoading(false);
     }
   }
 
-  const confidenceStyle = (
+  /* =======================================================
+     STYLES
+     ======================================================= */
+
+  function confidenceStyle(
     level: string
-  ) => {
+  ) {
     if (level === "HIGH") {
       return "bg-green-100 text-green-800";
     }
@@ -670,11 +537,11 @@ export default function AIAnalysis({
     }
 
     return "bg-slate-100 text-slate-700";
-  };
+  }
 
-  const severityStyle = (
+  function severityStyle(
     severity: string
-  ) => {
+  ) {
     if (severity === "HIGH") {
       return "bg-red-100 text-red-800";
     }
@@ -688,11 +555,11 @@ export default function AIAnalysis({
     }
 
     return "bg-slate-100 text-slate-700";
-  };
+  }
 
-  const weatherStyle = (
+  function weatherStyle(
     status: string
-  ) => {
+  ) {
     if (status === "ACT_NOW") {
       return "bg-green-100 text-green-800";
     }
@@ -701,293 +568,484 @@ export default function AIAnalysis({
       return "bg-amber-100 text-amber-800";
     }
 
-    if (status === "EXPERT_REVIEW") {
+    if (
+      status ===
+      "EXPERT_REVIEW"
+    ) {
       return "bg-red-100 text-red-800";
     }
 
     return "bg-blue-100 text-blue-800";
-  };
+  }
+
+  /* =======================================================
+     UI
+     ======================================================= */
 
   return (
-    <section className="mt-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-        <div>
-          <p className="text-sm font-semibold text-green-700">
-            STEP 02
-          </p>
+    <section className="mt-5 overflow-hidden rounded-[25px] border border-[#dfe9e1] bg-white shadow-[0_8px_25px_rgba(31,62,43,0.05)]">
 
-          <h3 className="mt-1 text-2xl font-bold">
-            AI Field Analysis
-          </h3>
+      <div className="h-1 bg-gradient-to-r from-[#173b2b] via-[#65b83f] to-[#b8dd73]" />
 
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-            AgriCustos screens the crop image locally,
-            combines the visual signal with field context
-            and upcoming weather, and produces a
-            field-action assessment.
-          </p>
-        </div>
+      <div className="p-6">
 
-        <button
-          type="button"
-          onClick={analyzeCrop}
-          disabled={loading}
-          className="rounded-xl bg-green-700 px-5 py-3 text-sm font-semibold text-white transition hover:bg-green-800 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {loading
-            ? "Analyzing field..."
-            : "Analyze Crop"}
-        </button>
-      </div>
+        {/* HEADER */}
 
-      {loading && (
-        <div className="mt-6 rounded-2xl bg-green-50 p-5">
-          <div className="flex items-center gap-3">
-            <div className="h-5 w-5 animate-spin rounded-full border-2 border-green-200 border-t-green-700" />
+        <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+
+          <div className="flex gap-4">
+
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#173b2b] text-sm font-black text-white">
+              03
+            </div>
 
             <div>
-              <p className="font-semibold text-green-800">
-                Running field intelligence...
+
+              <p className="text-[9px] font-extrabold tracking-[0.18em] text-[#57973d]">
+                FIELD INTELLIGENCE
               </p>
 
-              <p className="mt-1 text-xs text-green-700">
-                First analysis may take longer while the
-                vision model loads into the browser.
+              <h3 className="mt-1 text-2xl font-black text-[#203529]">
+                AI Field Analysis
+              </h3>
+
+              <p className="mt-1 max-w-xl text-sm leading-6 text-[#718078]">
+                Combine crop observations,
+                field context and weather
+                conditions.
               </p>
+
             </div>
           </div>
+
+          <button
+            type="button"
+            onClick={analyzeCrop}
+            disabled={loading}
+            className="rounded-xl bg-[#173b2b] px-5 py-3 text-sm font-extrabold text-white shadow-sm transition hover:bg-[#0f2f21] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading
+              ? "Analyzing..."
+              : "Analyze Crop"}
+          </button>
+
         </div>
-      )}
 
-      {error && !loading && (
-        <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5">
-          <p className="font-semibold text-red-800">
-            Analysis unavailable
-          </p>
+        {/* PROGRESS */}
 
-          <p className="mt-1 text-sm text-red-700">
-            {error}
-          </p>
-        </div>
-      )}
+        {loading && (
+          <div className="mt-6 overflow-hidden rounded-2xl border border-[#d9ebd3] bg-[#f3faef]">
 
-      {analysis && !loading && (
-        <div className="mt-8 space-y-6">
-          <div className="rounded-2xl bg-slate-900 p-6 text-white">
-            <p className="text-sm font-semibold text-green-300">
-              FARMER ACTION SUMMARY
-            </p>
+            <div className="h-1 bg-[#e2efdd]">
 
-            <p className="mt-3 text-lg leading-8">
-              {analysis.farmer_summary}
-            </p>
-          </div>
+              <div
+                className="h-full bg-[#65b83f] transition-all duration-500"
+                style={{
+                  width:
+                    progressStep === 1
+                      ? "25%"
+                      : progressStep === 2
+                      ? "50%"
+                      : progressStep === 3
+                      ? "75%"
+                      : "95%",
+                }}
+              />
 
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="rounded-2xl border border-slate-200 p-5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Field severity
-              </p>
-
-              <span
-                className={`mt-3 inline-flex rounded-full px-3 py-1 text-sm font-semibold ${severityStyle(
-                  analysis.severity
-                )}`}
-              >
-                {analysis.severity}
-              </span>
             </div>
 
-            <div className="rounded-2xl border border-slate-200 p-5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Crop
-              </p>
+            <div className="p-5">
 
-              <p className="mt-3 font-semibold">
-                {analysis.crop}
-              </p>
-            </div>
+              <div className="flex items-center gap-3">
 
-            <div className="rounded-2xl border border-slate-200 p-5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Next check
-              </p>
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-[#cde5c5] border-t-[#4b9137]" />
 
-              <p className="mt-3 font-semibold">
-                {analysis.follow_up.interval_hours}{" "}
-                hours
-              </p>
-            </div>
-          </div>
+                <div>
 
-          <div>
-            <h4 className="text-lg font-bold">
-              What the AI observed
-            </h4>
+                  <p className="font-bold text-[#397c2c]">
+                    {progress ||
+                      "Analyzing field..."}
+                  </p>
 
-            <ul className="mt-3 space-y-2">
-              {analysis.observations.map(
-                (observation, index) => (
-                  <li
-                    key={index}
-                    className="rounded-xl bg-slate-50 p-4 text-sm leading-6 text-slate-700"
-                  >
-                    {observation}
-                  </li>
-                )
-              )}
-            </ul>
-          </div>
+                  <p className="mt-1 text-xs text-[#66805f]">
+                    This can take a little while
+                    while Field Intelligence
+                    evaluates the image.
+                  </p>
 
-          <div>
-            <h4 className="text-lg font-bold">
-              Possible crop conditions
-            </h4>
+                </div>
 
-            <div className="mt-3 space-y-3">
-              {analysis.possible_conditions.map(
-                (condition, index) => (
-                  <div
-                    key={index}
-                    className="rounded-2xl border border-slate-200 p-5"
-                  >
-                    <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
-                      <p className="font-semibold">
-                        {condition.condition}
-                      </p>
-
-                      <span
-                        className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${confidenceStyle(
-                          condition.confidence_level
-                        )}`}
-                      >
-                        {condition.confidence_level}{" "}
-                        confidence
-                      </span>
-                    </div>
-
-                    <p className="mt-2 text-sm leading-6 text-slate-600">
-                      {condition.reason}
-                    </p>
-                  </div>
-                )
-              )}
-            </div>
-          </div>
-
-          <div>
-            <h4 className="text-lg font-bold">
-              Recommended management
-            </h4>
-
-            <div className="mt-3 space-y-3">
-              {analysis.management_guidance.map(
-                (guidance, index) => (
-                  <div
-                    key={index}
-                    className="flex gap-3 rounded-xl bg-green-50 p-4"
-                  >
-                    <span className="font-bold text-green-700">
-                      {index + 1}.
-                    </span>
-
-                    <p className="text-sm leading-6 text-green-900">
-                      {guidance}
-                    </p>
-                  </div>
-                )
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-slate-200 p-5">
-            <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  Weather-aware action
-                </p>
-
-                <p className="mt-2 text-xl font-bold">
-                  {analysis.weather_assessment.action_window}
-                </p>
               </div>
 
-              <span
-                className={`w-fit rounded-full px-3 py-1 text-sm font-semibold ${weatherStyle(
-                  analysis.weather_assessment.status
-                )}`}
-              >
-                {analysis.weather_assessment.status}
-              </span>
-            </div>
+              <div className="mt-4 grid grid-cols-4 gap-2">
 
-            <p className="mt-4 text-sm leading-6 text-slate-600">
-              {analysis.weather_assessment.reason}
-            </p>
-          </div>
-
-          <div className="rounded-2xl bg-blue-50 p-5">
-            <p className="text-sm font-semibold text-blue-900">
-              🔔 Follow-up monitoring
-            </p>
-
-            <p className="mt-2 text-sm leading-6 text-blue-800">
-              {analysis.follow_up.reason}
-            </p>
-
-            <div className="mt-4 inline-flex rounded-xl bg-white px-4 py-3 text-sm font-semibold text-blue-900">
-              Check again in{" "}
-              {analysis.follow_up.interval_hours}{" "}
-              hours
-            </div>
-          </div>
-
-          {analysis.uncertainties.length > 0 && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
-              <p className="font-semibold text-amber-900">
-                ⚠️ Important uncertainty
-              </p>
-
-              <ul className="mt-3 space-y-2">
-                {analysis.uncertainties.map(
-                  (item, index) => (
-                    <li
-                      key={index}
-                      className="text-sm leading-6 text-amber-800"
+                {[
+                  "Image",
+                  "Weather",
+                  "AI",
+                  "Result",
+                ].map(
+                  (
+                    step,
+                    index
+                  ) => (
+                    <div
+                      key={step}
+                      className={`rounded-lg px-2 py-2 text-center text-[10px] font-bold ${
+                        progressStep >
+                          index
+                          ? "bg-[#dff0d8] text-[#397c2c]"
+                          : "bg-white text-[#9ba69f]"
+                      }`}
                     >
-                      • {item}
-                    </li>
+                      {step}
+                    </div>
                   )
                 )}
-              </ul>
+
+              </div>
+
             </div>
-          )}
-
-          {analysis.expert_review.recommended && (
-            <div className="rounded-2xl border border-red-200 bg-red-50 p-5">
-              <p className="font-semibold text-red-900">
-                👨‍🌾 Expert review recommended
-              </p>
-
-              <p className="mt-2 text-sm leading-6 text-red-800">
-                {analysis.expert_review.reason}
-              </p>
-            </div>
-          )}
-
-          <div className="border-t border-slate-200 pt-5">
-            <p className="text-xs leading-5 text-slate-500">
-              AgriCustos provides AI-assisted visual
-              screening and field decision support, not a
-              guaranteed diagnosis. Confidence describes
-              the visual model's confidence in a category,
-              not treatment success. Confirm important
-              decisions using locally appropriate
-              agricultural guidance.
-            </p>
           </div>
-        </div>
-      )}
+        )}
+
+        {/* ERROR */}
+
+        {error && !loading && (
+          <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5">
+
+            <p className="font-bold text-red-800">
+              Analysis unavailable
+            </p>
+
+            <p className="mt-1 text-sm text-red-700">
+              {error}
+            </p>
+
+          </div>
+        )}
+
+        {/* RESULT */}
+
+        {analysis && !loading && (
+          <div className="mt-8 space-y-6">
+
+            {/* SUMMARY */}
+
+            <div className="rounded-[22px] bg-[#173b2b] p-6 text-white">
+
+              <p className="text-[9px] font-extrabold tracking-[0.18em] text-[#bce994]">
+                FARMER SUMMARY
+              </p>
+
+              <p className="mt-3 text-lg font-semibold leading-8">
+                {analysis.farmer_summary}
+              </p>
+
+            </div>
+
+            {/* QUICK RESULT */}
+
+            <div className="grid gap-4 md:grid-cols-2">
+
+              <div className="rounded-2xl border border-[#e2ebe4] bg-[#fafcf9] p-5">
+
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.15em] text-[#8c9991]">
+                  Severity
+                </p>
+
+                <span
+                  className={`mt-3 inline-flex rounded-full px-3 py-1.5 text-xs font-extrabold ${severityStyle(
+                    analysis.severity
+                  )}`}
+                >
+                  {analysis.severity}
+                </span>
+
+              </div>
+
+              <div className="rounded-2xl border border-[#e2ebe4] bg-[#fafcf9] p-5">
+
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.15em] text-[#8c9991]">
+                  Crop
+                </p>
+
+                <p className="mt-3 font-black text-[#24382b]">
+                  {analysis.crop}
+                </p>
+
+              </div>
+
+            </div>
+
+            {/* OBSERVATIONS */}
+
+            <div>
+
+              <h4 className="text-lg font-black">
+                What Field Intelligence observed
+              </h4>
+
+              <div className="mt-3 space-y-2">
+
+                {analysis.observations.map(
+                  (
+                    observation,
+                    index
+                  ) => (
+                    <div
+                      key={index}
+                      className="rounded-xl bg-[#f6faf7] p-4 text-sm leading-6 text-[#536159]"
+                    >
+                      {observation}
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </div>
+
+            {/* CONDITIONS */}
+
+            <div>
+
+              <h4 className="text-lg font-black">
+                Possible crop conditions
+              </h4>
+
+              <div className="mt-3 space-y-3">
+
+                {analysis.possible_conditions.map(
+                  (
+                    condition,
+                    index
+                  ) => (
+                    <div
+                      key={index}
+                      className="rounded-2xl border border-[#e2ebe4] p-5"
+                    >
+
+                      <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+
+                        <p className="font-black">
+                          {
+                            condition.condition
+                          }
+                        </p>
+
+                        <span
+                          className={`w-fit rounded-full px-3 py-1 text-xs font-bold ${confidenceStyle(
+                            condition.confidence_level
+                          )}`}
+                        >
+                          {
+                            condition.confidence_level
+                          }{" "}
+                          confidence
+                        </span>
+
+                      </div>
+
+                      <p className="mt-2 text-sm leading-6 text-[#68766e]">
+                        {condition.reason}
+                      </p>
+
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </div>
+
+            {/* MANAGEMENT */}
+
+            <div>
+
+              <h4 className="text-lg font-black">
+                Recommended management
+              </h4>
+
+              <div className="mt-3 space-y-3">
+
+                {analysis.management_guidance.map(
+                  (
+                    guidance,
+                    index
+                  ) => (
+                    <div
+                      key={index}
+                      className="flex gap-3 rounded-xl bg-[#edf7e9] p-4"
+                    >
+
+                      <span className="font-black text-[#4b9137]">
+                        {index + 1}.
+                      </span>
+
+                      <p className="text-sm leading-6 text-[#35552f]">
+                        {guidance}
+                      </p>
+
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </div>
+
+            {/* WEATHER */}
+
+            <div className="rounded-2xl border border-[#e2ebe4] p-5">
+
+              <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+
+                <div>
+
+                  <p className="text-[9px] font-extrabold uppercase tracking-[0.15em] text-[#8c9991]">
+                    Weather-aware action
+                  </p>
+
+                  <p className="mt-2 text-xl font-black">
+                    {
+                      analysis
+                        .weather_assessment
+                        .action_window
+                    }
+                  </p>
+
+                </div>
+
+                <span
+                  className={`w-fit rounded-full px-3 py-1.5 text-xs font-extrabold ${weatherStyle(
+                    analysis
+                      .weather_assessment
+                      .status
+                  )}`}
+                >
+                  {
+                    analysis
+                      .weather_assessment
+                      .status
+                  }
+                </span>
+
+              </div>
+
+              <p className="mt-4 text-sm leading-6 text-[#68766e]">
+                {
+                  analysis
+                    .weather_assessment
+                    .reason
+                }
+              </p>
+
+            </div>
+
+            {/* FOLLOW UP */}
+
+            <div className="rounded-2xl bg-[#eef6fc] p-5">
+
+              <p className="font-bold text-[#315c7a]">
+                Follow-up monitoring
+              </p>
+
+              <p className="mt-2 text-sm leading-6 text-[#426b87]">
+                {
+                  analysis.follow_up
+                    .reason
+                }
+              </p>
+
+              {analysis.follow_up
+                .recommended &&
+                analysis.follow_up
+                  .interval_hours >
+                  0 && (
+                  <div className="mt-4 inline-flex rounded-xl bg-white px-4 py-3 text-sm font-bold text-[#315c7a]">
+                    Check again in{" "}
+                    {
+                      analysis.follow_up
+                        .interval_hours
+                    }{" "}
+                    hours
+                  </div>
+                )}
+
+            </div>
+
+            {/* UNCERTAINTIES */}
+
+            {analysis.uncertainties
+              .length > 0 && (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
+
+                <p className="font-bold text-amber-900">
+                  Important uncertainty
+                </p>
+
+                <ul className="mt-3 space-y-2">
+
+                  {analysis.uncertainties.map(
+                    (
+                      item,
+                      index
+                    ) => (
+                      <li
+                        key={index}
+                        className="text-sm leading-6 text-amber-800"
+                      >
+                        • {item}
+                      </li>
+                    )
+                  )}
+
+                </ul>
+
+              </div>
+            )}
+
+            {/* EXPERT REVIEW */}
+
+            {analysis.expert_review
+              .recommended && (
+              <div className="rounded-2xl border border-red-200 bg-red-50 p-5">
+
+                <p className="font-bold text-red-900">
+                  Expert review recommended
+                </p>
+
+                <p className="mt-2 text-sm leading-6 text-red-800">
+                  {
+                    analysis
+                      .expert_review
+                      .reason
+                  }
+                </p>
+
+              </div>
+            )}
+
+            {/* DISCLAIMER */}
+
+            <div className="border-t border-[#e2ebe4] pt-5">
+
+              <p className="text-xs leading-5 text-[#7b8780]">
+                AgriCustos provides
+                AI-assisted agricultural
+                decision support, not a
+                guaranteed diagnosis. Always
+                follow locally approved
+                agricultural guidance.
+              </p>
+
+            </div>
+
+          </div>
+        )}
+
+      </div>
     </section>
   );
 }
