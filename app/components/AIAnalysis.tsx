@@ -1,14 +1,7 @@
 "use client";
 
 import { useState } from "react";
-
-type AIAnalysisProps = {
-  image: File | null;
-  crop: string;
-  location: string;
-  latitude: number | null;
-  longitude: number | null;
-};
+import { pipeline } from "@huggingface/transformers";
 
 type AnalysisResult = {
   crop: string;
@@ -21,7 +14,11 @@ type AnalysisResult = {
   severity: "LOW" | "MODERATE" | "HIGH" | "UNKNOWN";
   management_guidance: string[];
   weather_assessment: {
-    status: "ACT_NOW" | "WAIT" | "MONITOR" | "EXPERT_REVIEW";
+    status:
+      | "ACT_NOW"
+      | "WAIT"
+      | "MONITOR"
+      | "EXPERT_REVIEW";
     reason: string;
     action_window: string;
   };
@@ -38,16 +35,112 @@ type AnalysisResult = {
   farmer_summary: string;
 };
 
+type AIAnalysisProps = {
+  image: File | null;
+  crop: string;
+  location: string;
+  latitude: number | null;
+  longitude: number | null;
+  onAnalysisComplete?: (
+    analysis: AnalysisResult
+  ) => void;
+};
+
+type ClassResult = {
+  label: string;
+  score: number;
+};
+
+let classifierPromise: Promise<any> | null = null;
+
+async function getClassifier() {
+  if (!classifierPromise) {
+    classifierPromise = pipeline(
+      "zero-shot-image-classification",
+      "Xenova/clip-vit-base-patch32"
+    );
+  }
+
+  return classifierPromise;
+}
+
+function confidenceFromScore(
+  score: number
+): "HIGH" | "MEDIUM" | "LOW" {
+  if (score >= 0.6) return "HIGH";
+  if (score >= 0.35) return "MEDIUM";
+  return "LOW";
+}
+
+function conditionName(label: string) {
+  const names: Record<string, string> = {
+    healthy: "Healthy-looking crop tissue",
+    fungal: "Possible fungal disease symptoms",
+    bacterial: "Possible bacterial disease symptoms",
+    viral: "Possible viral disease symptoms",
+    pest: "Possible pest or insect damage",
+    nutrient: "Possible nutrient deficiency or imbalance",
+    drought: "Possible drought or heat stress",
+    water: "Possible excess-moisture or water stress",
+    physical: "Possible physical or environmental damage",
+  };
+
+  return names[label] || label;
+}
+
+function buildCandidates(crop: string) {
+  const c = crop.trim() || "crop";
+
+  return [
+    {
+      key: "healthy",
+      text: `a healthy ${c} leaf with normal green tissue`,
+    },
+    {
+      key: "fungal",
+      text: `a ${c} leaf showing fungal disease symptoms`,
+    },
+    {
+      key: "bacterial",
+      text: `a ${c} leaf showing bacterial disease symptoms`,
+    },
+    {
+      key: "viral",
+      text: `a ${c} leaf showing viral disease symptoms`,
+    },
+    {
+      key: "pest",
+      text: `a ${c} leaf showing insect or pest damage`,
+    },
+    {
+      key: "nutrient",
+      text: `a ${c} leaf showing nutrient deficiency symptoms`,
+    },
+    {
+      key: "drought",
+      text: `a ${c} leaf showing drought or heat stress`,
+    },
+    {
+      key: "water",
+      text: `a ${c} leaf showing excess moisture or water stress`,
+    },
+    {
+      key: "physical",
+      text: `a ${c} leaf showing physical or environmental damage`,
+    },
+  ];
+}
+
 export default function AIAnalysis({
   image,
   crop,
   location,
   latitude,
   longitude,
+  onAnalysisComplete,
 }: AIAnalysisProps) {
-  const [analysis, setAnalysis] = useState<AnalysisResult | null>(
-    null
-  );
+  const [analysis, setAnalysis] =
+    useState<AnalysisResult | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -63,8 +156,13 @@ export default function AIAnalysis({
       return;
     }
 
-    if (latitude === null || longitude === null) {
-      setError("Please capture the field location first.");
+    if (
+      latitude === null ||
+      longitude === null
+    ) {
+      setError(
+        "Please capture the field location first."
+      );
       return;
     }
 
@@ -73,7 +171,10 @@ export default function AIAnalysis({
       setError("");
       setAnalysis(null);
 
-      // Get current + upcoming weather for the AI decision.
+      /*
+       * WEATHER
+       */
+
       const weatherUrl =
         `https://api.open-meteo.com/v1/forecast` +
         `?latitude=${latitude}` +
@@ -83,7 +184,8 @@ export default function AIAnalysis({
         `&forecast_days=2` +
         `&timezone=auto`;
 
-      const weatherResponse = await fetch(weatherUrl);
+      const weatherResponse =
+        await fetch(weatherUrl);
 
       if (!weatherResponse.ok) {
         throw new Error(
@@ -91,63 +193,461 @@ export default function AIAnalysis({
         );
       }
 
-      const weatherData = await weatherResponse.json();
+      const weatherData =
+        await weatherResponse.json();
 
-      const next12HourRainProbability =
-        weatherData.hourly?.precipitation_probability
+      const rainProbability =
+        weatherData.hourly
+          ?.precipitation_probability
           ?.slice(0, 12) ?? [];
 
-      const next12HourRain =
-        weatherData.hourly?.rain?.slice(0, 12) ?? [];
+      const rainForecast =
+        weatherData.hourly?.rain?.slice(
+          0,
+          12
+        ) ?? [];
 
       const maxRainProbability =
-        next12HourRainProbability.length > 0
-          ? Math.max(...next12HourRainProbability)
+        rainProbability.length
+          ? Math.max(...rainProbability)
           : 0;
 
       const totalForecastRain =
-        next12HourRain.reduce(
-          (sum: number, value: number) => sum + (value || 0),
+        rainForecast.reduce(
+          (sum: number, value: number) =>
+            sum + (value || 0),
           0
         );
 
-      const weatherSummary = `
-Current temperature: ${weatherData.current?.temperature_2m ?? "unknown"} °C
-Current humidity: ${weatherData.current?.relative_humidity_2m ?? "unknown"} %
-Rain currently: ${weatherData.current?.rain ?? "unknown"} mm
-Wind speed: ${weatherData.current?.wind_speed_10m ?? "unknown"} km/h
-Maximum precipitation probability over next 12 hours: ${maxRainProbability} %
-Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
-`;
+      const temperature =
+        Number(
+          weatherData.current?.temperature_2m
+        ) || 0;
 
-      const formData = new FormData();
+      const humidity =
+        Number(
+          weatherData.current
+            ?.relative_humidity_2m
+        ) || 0;
 
-      formData.append("image", image);
-      formData.append("crop", crop);
-      formData.append("location", location);
-      formData.append("weather", weatherSummary);
+      /*
+       * LOCAL VISION MODEL
+       */
 
-      const response = await fetch("/api/analyze", {
-        method: "POST",
-        body: formData,
-      });
+      const classifier =
+        await getClassifier();
 
-      const result = await response.json();
+      const candidates =
+        buildCandidates(crop);
 
-      if (!response.ok) {
+      const imageUrl =
+        URL.createObjectURL(image);
+
+      let visualResults: ClassResult[];
+
+      try {
+        visualResults =
+          await classifier(
+            imageUrl,
+            candidates.map(
+              (item) => item.text
+            ),
+            {
+              top_k: 5,
+            }
+          );
+      } finally {
+        URL.revokeObjectURL(imageUrl);
+      }
+
+      if (
+        !visualResults ||
+        !visualResults.length
+      ) {
         throw new Error(
-          result.error || "AI analysis failed."
+          "The field vision model returned no visual result."
         );
       }
 
-      if (!result.analysis) {
-        throw new Error(
-          "The AI returned no analysis."
+      const topResult =
+        visualResults[0];
+
+      const topCandidate =
+        candidates.find(
+          (candidate) =>
+            candidate.text ===
+            topResult.label
+        );
+
+      const topKey =
+        topCandidate?.key || "unknown";
+
+      const confidence =
+        topResult.score;
+
+      /*
+       * WEATHER-AWARE RISK
+       */
+
+      const diseaseLike = [
+        "fungal",
+        "bacterial",
+        "viral",
+      ].includes(topKey);
+
+      const pestLike =
+        topKey === "pest";
+
+      const stressLike = [
+        "drought",
+        "water",
+        "nutrient",
+        "physical",
+      ].includes(topKey);
+
+      let severity:
+        | "LOW"
+        | "MODERATE"
+        | "HIGH"
+        | "UNKNOWN" = "LOW";
+
+      if (
+        confidence >= 0.6 &&
+        (diseaseLike || pestLike)
+      ) {
+        severity = "HIGH";
+      } else if (
+        confidence >= 0.35 &&
+        (diseaseLike ||
+          pestLike ||
+          stressLike)
+      ) {
+        severity = "MODERATE";
+      }
+
+      const diseaseWeatherRisk =
+        diseaseLike &&
+        (humidity >= 75 ||
+          maxRainProbability >= 60 ||
+          totalForecastRain >= 2);
+
+      if (
+        diseaseWeatherRisk &&
+        severity === "MODERATE"
+      ) {
+        severity = "HIGH";
+      }
+
+      /*
+       * OBSERVATIONS
+       */
+
+      const observations: string[] = [
+        `The visual screening model most strongly matched: ${topResult.label}.`,
+        `Visual screening confidence: ${(confidence * 100).toFixed(0)}%.`,
+        `Field location captured at ${latitude.toFixed(
+          4
+        )}, ${longitude.toFixed(4)}.`,
+      ];
+
+      if (humidity >= 75) {
+        observations.push(
+          `Current relative humidity is ${humidity}%, which indicates a humid field environment.`
         );
       }
 
-      setAnalysis(result.analysis);
+      if (maxRainProbability >= 60) {
+        observations.push(
+          `Rain probability reaches ${maxRainProbability}% during the next 12 hours.`
+        );
+      }
+
+      if (temperature >= 35) {
+        observations.push(
+          `Current temperature is ${temperature}°C, so heat stress should be considered.`
+        );
+      }
+
+      /*
+       * POSSIBLE CONDITIONS
+       */
+
+      const possibleConditions =
+        visualResults
+          .slice(0, 3)
+          .map((result) => {
+            const candidate =
+              candidates.find(
+                (item) =>
+                  item.text ===
+                  result.label
+              );
+
+            const key =
+              candidate?.key || "unknown";
+
+            let reason =
+              `The visual model assigned ${(result.score * 100).toFixed(
+                0
+              )}% relative confidence to this visual category.`;
+
+            if (
+              key === "fungal" &&
+              diseaseWeatherRisk
+            ) {
+              reason +=
+                " Humidity/rain conditions also increase the need for field inspection.";
+            }
+
+            return {
+              condition:
+                conditionName(key),
+              confidence_level:
+                confidenceFromScore(
+                  result.score
+                ),
+              reason,
+            };
+          });
+
+      /*
+       * MANAGEMENT
+       */
+
+      const management: string[] = [];
+
+      if (topKey === "healthy") {
+        management.push(
+          "Continue routine field scouting and compare new images with this baseline."
+        );
+
+        management.push(
+          "Prioritize irrigation, nutrition, and pest monitoring according to the crop's normal schedule."
+        );
+      } else if (diseaseLike) {
+        management.push(
+          "Inspect several plants across the field to determine whether the visual symptoms are widespread or localized."
+        );
+
+        management.push(
+          "Remove or isolate clearly affected plant material where appropriate and avoid unnecessary movement of potentially contaminated material between field areas."
+        );
+
+        management.push(
+          "If disease symptoms are confirmed, follow locally approved agricultural guidance and product labels for the specific crop and condition."
+        );
+      } else if (pestLike) {
+        management.push(
+          "Inspect both sides of leaves and nearby plants for active pests and fresh feeding damage."
+        );
+
+        management.push(
+          "Check whether damage is isolated or spreading before choosing a control measure."
+        );
+
+        management.push(
+          "Use locally approved integrated pest-management guidance for the identified crop and pest."
+        );
+      } else if (topKey === "drought") {
+        management.push(
+          "Inspect soil moisture and plants across multiple field locations rather than judging the entire field from one image."
+        );
+
+        management.push(
+          "Prioritize appropriate irrigation according to crop stage, soil condition, and local agronomic guidance."
+        );
+      } else if (topKey === "water") {
+        management.push(
+          "Inspect drainage and soil moisture around affected plants."
+        );
+
+        management.push(
+          "Avoid unnecessary additional irrigation until field moisture conditions are confirmed."
+        );
+      } else if (topKey === "nutrient") {
+        management.push(
+          "Compare symptoms across older and younger leaves and inspect whether the pattern is uniform across the field."
+        );
+
+        management.push(
+          "Confirm suspected nutrient problems with appropriate soil or plant testing before applying corrective inputs."
+        );
+      } else {
+        management.push(
+          "Inspect several plants around the field to verify whether the observed pattern is representative."
+        );
+
+        management.push(
+          "Continue monitoring the affected area and compare the next image with this assessment."
+        );
+      }
+
+      /*
+       * WEATHER DECISION
+       */
+
+      let weatherStatus:
+        | "ACT_NOW"
+        | "WAIT"
+        | "MONITOR"
+        | "EXPERT_REVIEW" =
+        "MONITOR";
+
+      let actionWindow =
+        "Monitor the field and reassess during the next scouting cycle.";
+
+      let weatherReason =
+        `Current conditions are ${temperature}°C with ${humidity}% relative humidity.`;
+
+      if (
+        diseaseLike &&
+        maxRainProbability >= 60
+      ) {
+        weatherStatus = "ACT_NOW";
+
+        actionWindow =
+          "Prioritize field inspection before or around the upcoming wet period.";
+
+        weatherReason =
+          `Disease-like visual symptoms combined with a ${maxRainProbability}% rain probability create a higher-priority scouting window.`;
+      } else if (
+        diseaseLike &&
+        humidity >= 75
+      ) {
+        weatherStatus = "MONITOR";
+
+        actionWindow =
+          "Inspect within the next 24 hours.";
+
+        weatherReason =
+          `The field is currently humid (${humidity}%), which makes close monitoring of disease-like symptoms more important.`;
+      } else if (
+        topKey === "drought" &&
+        temperature >= 35
+      ) {
+        weatherStatus = "ACT_NOW";
+
+        actionWindow =
+          "Inspect crop water status during the current heat period.";
+
+        weatherReason =
+          `Temperature is ${temperature}°C and the image shows possible heat/drought stress.`;
+      } else if (
+        maxRainProbability >= 70
+      ) {
+        weatherStatus = "WAIT";
+
+        actionWindow =
+          "Complete non-urgent field work before the wet period where practical.";
+
+        weatherReason =
+          `Rain probability reaches ${maxRainProbability}% during the next 12 hours.`;
+      }
+
+      /*
+       * FOLLOW-UP
+       */
+
+      let followUpHours = 48;
+
+      if (
+        severity === "HIGH" ||
+        diseaseWeatherRisk
+      ) {
+        followUpHours = 24;
+      } else if (
+        severity === "MODERATE"
+      ) {
+        followUpHours = 36;
+      }
+
+      /*
+       * UNCERTAINTIES
+       */
+
+      const uncertainties: string[] = [
+        "This is visual screening rather than a laboratory-confirmed diagnosis.",
+        "A single crop image may not represent conditions across the entire field.",
+      ];
+
+      if (confidence < 0.5) {
+        uncertainties.push(
+          "The visual signal is not strong enough to treat the predicted category as a confirmed diagnosis."
+        );
+      }
+
+      /*
+       * EXPERT REVIEW
+       */
+
+      const expertRecommended =
+        confidence < 0.35 ||
+        severity === "HIGH";
+
+      /*
+       * FARMER SUMMARY
+       */
+
+      let farmerSummary = "";
+
+      if (topKey === "healthy") {
+        farmerSummary =
+          `The ${crop} image currently looks closer to healthy crop tissue than the other visual categories tested. Keep this assessment as a field baseline and continue routine scouting.`;
+      } else {
+        farmerSummary =
+          `AgriCustos detected a ${conditionName(
+            topKey
+          ).toLowerCase()} pattern in the ${crop} image. ${actionWindow} Recheck the affected area in about ${followUpHours} hours and compare new images for progression.`;
+      }
+
+      if (diseaseWeatherRisk) {
+        farmerSummary +=
+          " Weather conditions make disease-related monitoring more important right now.";
+      }
+
+      const finalAnalysis: AnalysisResult = {
+        crop,
+        observations,
+        possible_conditions:
+          possibleConditions,
+        severity,
+        management_guidance:
+          management,
+        weather_assessment: {
+          status: weatherStatus,
+          reason: weatherReason,
+          action_window: actionWindow,
+        },
+        follow_up: {
+          recommended: true,
+          interval_hours:
+            followUpHours,
+          reason:
+            "Compare the next field image with this assessment and check whether symptoms are spreading, stabilizing, or improving.",
+        },
+        uncertainties,
+        expert_review: {
+          recommended:
+            expertRecommended,
+          reason:
+            expertRecommended
+              ? "The visual evidence is either uncertain or indicates a higher-priority field condition that should be verified by an agricultural professional."
+              : "Current visual evidence is sufficient for routine field monitoring, but confirmation is recommended if symptoms progress.",
+        },
+        farmer_summary:
+          farmerSummary,
+      };
+
+      setAnalysis(finalAnalysis);
+
+      // Send the completed result back to the dashboard.
+      onAnalysisComplete?.(finalAnalysis);
     } catch (err) {
+      console.error(
+        "AgriCustos local AI error:",
+        err
+      );
+
       setError(
         err instanceof Error
           ? err.message
@@ -158,7 +658,9 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
     }
   }
 
-  const confidenceStyle = (level: string) => {
+  const confidenceStyle = (
+    level: string
+  ) => {
     if (level === "HIGH") {
       return "bg-green-100 text-green-800";
     }
@@ -170,7 +672,9 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
     return "bg-slate-100 text-slate-700";
   };
 
-  const severityStyle = (severity: string) => {
+  const severityStyle = (
+    severity: string
+  ) => {
     if (severity === "HIGH") {
       return "bg-red-100 text-red-800";
     }
@@ -186,7 +690,9 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
     return "bg-slate-100 text-slate-700";
   };
 
-  const weatherStyle = (status: string) => {
+  const weatherStyle = (
+    status: string
+  ) => {
     if (status === "ACT_NOW") {
       return "bg-green-100 text-green-800";
     }
@@ -215,8 +721,10 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
           </h3>
 
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-            AgriCustos evaluates the crop image together with field
-            context and upcoming weather conditions.
+            AgriCustos screens the crop image locally,
+            combines the visual signal with field context
+            and upcoming weather, and produces a
+            field-action assessment.
           </p>
         </div>
 
@@ -226,11 +734,12 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
           disabled={loading}
           className="rounded-xl bg-green-700 px-5 py-3 text-sm font-semibold text-white transition hover:bg-green-800 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {loading ? "Analyzing..." : "Analyze Crop"}
+          {loading
+            ? "Analyzing field..."
+            : "Analyze Crop"}
         </button>
       </div>
 
-      {/* Status */}
       {loading && (
         <div className="mt-6 rounded-2xl bg-green-50 p-5">
           <div className="flex items-center gap-3">
@@ -238,19 +747,18 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
 
             <div>
               <p className="font-semibold text-green-800">
-                Analyzing field conditions...
+                Running field intelligence...
               </p>
 
               <p className="mt-1 text-xs text-green-700">
-                Checking the crop image, location context, and
-                upcoming weather.
+                First analysis may take longer while the
+                vision model loads into the browser.
               </p>
             </div>
           </div>
         </div>
       )}
 
-      {/* Error */}
       {error && !loading && (
         <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5">
           <p className="font-semibold text-red-800">
@@ -263,13 +771,11 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
         </div>
       )}
 
-      {/* Results */}
       {analysis && !loading && (
         <div className="mt-8 space-y-6">
-          {/* Farmer summary */}
           <div className="rounded-2xl bg-slate-900 p-6 text-white">
             <p className="text-sm font-semibold text-green-300">
-              FARMER SUMMARY
+              FARMER ACTION SUMMARY
             </p>
 
             <p className="mt-3 text-lg leading-8">
@@ -277,11 +783,10 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </p>
           </div>
 
-          {/* Condition + severity */}
-          <div className="grid gap-4 md:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-3">
             <div className="rounded-2xl border border-slate-200 p-5">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Severity
+                Field severity
               </p>
 
               <span
@@ -302,9 +807,19 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
                 {analysis.crop}
               </p>
             </div>
+
+            <div className="rounded-2xl border border-slate-200 p-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Next check
+              </p>
+
+              <p className="mt-3 font-semibold">
+                {analysis.follow_up.interval_hours}{" "}
+                hours
+              </p>
+            </div>
           </div>
 
-          {/* Observations */}
           <div>
             <h4 className="text-lg font-bold">
               What the AI observed
@@ -324,7 +839,6 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </ul>
           </div>
 
-          {/* Possible conditions */}
           <div>
             <h4 className="text-lg font-bold">
               Possible crop conditions
@@ -347,7 +861,8 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
                           condition.confidence_level
                         )}`}
                       >
-                        {condition.confidence_level} confidence
+                        {condition.confidence_level}{" "}
+                        confidence
                       </span>
                     </div>
 
@@ -360,7 +875,6 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </div>
           </div>
 
-          {/* Management */}
           <div>
             <h4 className="text-lg font-bold">
               Recommended management
@@ -386,7 +900,6 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </div>
           </div>
 
-          {/* Weather decision */}
           <div className="rounded-2xl border border-slate-200 p-5">
             <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
               <div>
@@ -413,7 +926,6 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </p>
           </div>
 
-          {/* Follow-up */}
           <div className="rounded-2xl bg-blue-50 p-5">
             <p className="text-sm font-semibold text-blue-900">
               🔔 Follow-up monitoring
@@ -423,16 +935,13 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
               {analysis.follow_up.reason}
             </p>
 
-            {analysis.follow_up.recommended &&
-              analysis.follow_up.interval_hours > 0 && (
-                <div className="mt-4 inline-flex rounded-xl bg-white px-4 py-3 text-sm font-semibold text-blue-900">
-                  Check again in{" "}
-                  {analysis.follow_up.interval_hours} hours
-                </div>
-              )}
+            <div className="mt-4 inline-flex rounded-xl bg-white px-4 py-3 text-sm font-semibold text-blue-900">
+              Check again in{" "}
+              {analysis.follow_up.interval_hours}{" "}
+              hours
+            </div>
           </div>
 
-          {/* Uncertainty */}
           {analysis.uncertainties.length > 0 && (
             <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
               <p className="font-semibold text-amber-900">
@@ -454,7 +963,6 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </div>
           )}
 
-          {/* Expert review */}
           {analysis.expert_review.recommended && (
             <div className="rounded-2xl border border-red-200 bg-red-50 p-5">
               <p className="font-semibold text-red-900">
@@ -467,15 +975,15 @@ Estimated rain over next 12 hours: ${totalForecastRain.toFixed(1)} mm
             </div>
           )}
 
-          {/* AI disclaimer */}
           <div className="border-t border-slate-200 pt-5">
             <p className="text-xs leading-5 text-slate-500">
-              AgriCustos provides AI-assisted decision support, not
-              a guaranteed diagnosis. Confidence describes the
-              AI's confidence in its interpretation, not guaranteed
-              treatment success. Always follow locally approved
-              agricultural guidance and product labels where
-              applicable.
+              AgriCustos provides AI-assisted visual
+              screening and field decision support, not a
+              guaranteed diagnosis. Confidence describes
+              the visual model's confidence in a category,
+              not treatment success. Confirm important
+              decisions using locally appropriate
+              agricultural guidance.
             </p>
           </div>
         </div>
